@@ -160,9 +160,9 @@ Replace the epoch in Snowflake with a vector clock counter:
 ## Capacity Estimation
 
 - 1B IDs/day ÷ 86,400 sec = **~11,574 IDs/sec average**
-- Peak (assume 3× burst) = **~35K IDs/sec**
+- **80/20 rule:** 80% of requests arrive in 20% of the day (peak ~5 hours) → peak = (1B × 0.8) / (0.2 × 86,400) ≈ **~46K IDs/sec**
 - Each Snowflake worker: 4096 IDs/ms = **4M IDs/sec**
-- Workers needed: 35,000 / 4,000,000 ≈ **1 worker is enough**; run ~5–10 for HA and geo-distribution
+- Workers needed: 46,000 / 4,000,000 ≈ **1 worker is enough**; run ~5–10 for HA and geo-distribution
 
 ---
 

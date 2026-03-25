@@ -2,6 +2,9 @@
 
 ## Goal
 This project contains different topics for system design interview preparation and acutal use cases. Write short concise points, table, cheat-sheet style so that its easy to remember.
+* First section theory
+* Second seciton actual system design with functional, non functional requirement, capcaity estimation, algorithm to be used, write - read ratio etc.
+* Always consider 80:20 rule for capacity estimation
 
 ## Output Token Efficiency
 
