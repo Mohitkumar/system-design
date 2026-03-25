@@ -1,5 +1,8 @@
 # Claude Code Instructions
 
+## Goal
+This project contains different topics for system design interview preparation and acutal use cases. Write short concise points, table, cheat-sheet style so that its easy to remember.
+
 ## Output Token Efficiency
 
 - Be maximally concise. Lead with the action or answer, skip all preamble.

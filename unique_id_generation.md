@@ -131,3 +131,172 @@ Replace the epoch in Snowflake with a vector clock counter:
 | ULID | 128 | Yes (lex) | No | None | Very high |
 | Ticket server | 64 | Yes | No | Centralized | Low–Medium |
 | Vector clock ID | 64 | Yes | Yes | Gossip/sync | Medium |
+
+---
+
+# Unique ID Generation — System Design (Snowflake)
+
+---
+
+## Requirements
+
+**Functional**
+- Generate globally unique 64-bit numeric IDs
+- IDs must be sortable by generation time
+- `generateId()` → `uint64`
+
+**Non-Functional**
+
+| Requirement | Target |
+|---|---|
+| Throughput | 1B IDs/day ≈ ~12K IDs/sec peak (assume 3× headroom → 36K/sec) |
+| Latency | < 2ms p99 |
+| Availability | 99.99% |
+| No coordination | Workers generate IDs independently — no DB, no locks |
+| Monotonic within worker | IDs from the same worker are always increasing |
+
+---
+
+## Capacity Estimation
+
+- 1B IDs/day ÷ 86,400 sec = **~11,574 IDs/sec average**
+- Peak (assume 3× burst) = **~35K IDs/sec**
+- Each Snowflake worker: 4096 IDs/ms = **4M IDs/sec**
+- Workers needed: 35,000 / 4,000,000 ≈ **1 worker is enough**; run ~5–10 for HA and geo-distribution
+
+---
+
+## Bit Layout
+
+```
+ 63        22 21      12 11       0
+ ┌──────────┬──────────┬──────────┐
+ │ 41 bits  │ 10 bits  │ 12 bits  │
+ │timestamp │ workerID │ sequence │
+ └──────────┴──────────┴──────────┘
+  (sign bit = 0, always positive)
+```
+
+| Field | Bits | Max value | Notes |
+|---|---|---|---|
+| Sign | 1 | 0 | Always 0; keeps IDs positive |
+| Timestamp | 41 | 2^41 ms = 69 years | ms since custom epoch (e.g. 2024-01-01) |
+| Worker ID | 10 | 1024 workers | Split: 5 bits datacenter + 5 bits machine |
+| Sequence | 12 | 4096 per ms | Resets to 0 each millisecond |
+
+**ID construction:**
+```
+id = (timestamp << 22) | (workerID << 12) | sequence
+```
+
+---
+
+## High-Level Architecture
+
+```
+                     ┌─────────────────────┐
+                     │   Config Service     │  (ZooKeeper / etcd)
+                     │  assigns worker IDs  │
+                     └────────┬────────────┘
+                              │ worker ID on startup
+              ┌───────────────┼──────────────┐
+              ▼               ▼              ▼
+        [Worker 0]      [Worker 1]     [Worker N]
+        DC1 / M1        DC1 / M2       DC2 / M1
+              │               │
+         ────────────────────────────
+              │  HTTP/gRPC /generateId()
+              ▼
+         [ Clients ]
+```
+
+- Workers are **stateless** except for their worker ID and last-used timestamp.
+- Worker ID is leased from the config service at startup and released on shutdown.
+- No inter-worker communication needed during ID generation.
+
+---
+
+## Worker Internals
+
+```
+state:
+  workerID    = assigned at startup
+  lastMs      = last millisecond a batch was issued
+  sequence    = counter within current ms (0–4095)
+
+generateId():
+  now = currentTimeMs()
+
+  if now == lastMs:
+    sequence++
+    if sequence > 4095:          // exhausted 4096 slots in this ms
+      wait until next ms         // spin or sleep 1ms
+      now = currentTimeMs()
+      sequence = 0
+  else:
+    sequence = 0
+
+  if now < lastMs:               // clock moved backward
+    throw ClockBackwardException
+
+  lastMs = now
+  return (now - EPOCH) << 22 | workerID << 12 | sequence
+```
+
+---
+
+## Clock Skew & Clock Backward Problem
+
+Snowflake assumes the system clock only moves forward. NTP corrections can move the clock backward.
+
+| Scenario | Problem | Fix |
+|---|---|---|
+| Small backward jump (< 10ms) | Duplicate timestamp → possible duplicate ID | Spin-wait until `now >= lastMs` |
+| Large backward jump | Long stall blocking ID generation | Alert + pause worker; let ops investigate |
+| Clock drift across workers | IDs from different workers not globally monotonic | Acceptable — only monotonic *within* a worker |
+
+---
+
+## Worker ID Assignment
+
+Workers must have unique IDs. Two approaches:
+
+| Approach | How | Tradeoff |
+|---|---|---|
+| **Zookeeper / etcd lease** | Worker claims a node on startup; releases on shutdown. Ephemeral node expires if worker crashes. | Correct; requires ZK dependency |
+| **Static config** | Each host is pre-assigned an ID via config (e.g. k8s pod env var) | Simple; risk of misconfiguration → duplicate IDs |
+| **DB row lock** | Worker inserts a row claiming an ID; deletes on exit | Simple; DB becomes a dependency |
+
+**Recommended:** etcd lease — atomic claim, auto-release on crash.
+
+---
+
+## Availability & Failure Handling
+
+| Failure | Impact | Mitigation |
+|---|---|---|
+| Single worker crash | That worker's capacity lost | Run N workers; clients round-robin |
+| Config service down | New workers can't get IDs | Workers cache their ID; existing workers unaffected |
+| Clock moves backward | Worker stalls | Spin-wait (small) or alert (large); do NOT generate |
+| Worker ID exhausted (all 1024 used) | No new workers | Reclaim IDs of dead workers via lease expiry |
+
+---
+
+## Scalability
+
+- At 4096 IDs/ms, a **single worker** handles ~4M IDs/sec — far beyond most systems.
+- Scale out workers for **geo-distribution** (low latency to regional clients) and **HA**, not throughput.
+- With 10-bit worker field: max **1024 workers** globally. If more needed, sacrifice sequence bits (10 bits worker → 11 bits = 2048 workers, 11 bits sequence → 2048 IDs/ms).
+
+---
+
+## Summary Cheatsheet
+
+| Decision | Choice | Reason |
+|---|---|---|
+| ID size | 64-bit integer | DB index friendly, fits in most languages natively |
+| Time source | System clock (ms) | No coordination; NTP keeps it accurate enough |
+| Worker coordination | etcd lease for worker ID | Unique assignment without central bottleneck at generation time |
+| Clock backward | Spin-wait / alert | Safety over availability on clock issues |
+| Throughput | 4096/ms per worker | Exceeds any realistic single-service requirement |
+| Epoch | Custom (e.g. 2024-01-01) | Maximizes the 69-year lifespan |
