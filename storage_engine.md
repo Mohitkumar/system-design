@@ -1,7 +1,5 @@
 # Storage Engines
 
-> Key reference: *Designing Data-Intensive Applications* (DDIA) by Martin Kleppmann — Chapters 3 (Storage & Retrieval) and 7 (Transactions / MVCC).
-
 Two dominant storage engine architectures: **B+ Tree** (read-optimized) and **LSM Tree** (write-optimized).
 
 ---
