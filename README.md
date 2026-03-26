@@ -55,6 +55,7 @@ Sources: DDIA (Kleppmann) + Distributed Systems for Fun and Profit (Takada)
 
 - [cockroachdb.md](design/cockroachdb.md) — distributed SQL, Raft per range, SSI, HLC, intent-based commit, DistSQL
 - [tikv.md](design/tikv.md) — distributed KV, Multi-Raft regions, Percolator 2PC, TSO, RocksDB CFs
+- [ratelimiter.md](design/ratelimiter.md) — algorithms, Redis counter, Lua atomicity, distributed limiting, fail-open
 - [key_value_store.md](design/key_value_store.md)
 - [distributed_cache.md](design/distributed_cache.md)
 - [distributed_message_queue.md](design/distributed_message_queue.md)
