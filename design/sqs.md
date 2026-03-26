@@ -44,6 +44,21 @@ Storage (in-flight + retained):
 Bandwidth:
   Ingress:  35k/s × 1 KB = 35 MB/s
   Egress:   35k/s × 1 KB = 35 MB/s (each msg read once)
+
+IOPS:
+  Write: 35k msg/s × 1 sequential write = 35k sequential IOPS
+         × 3 AZ replicas = 105k sequential writes/s across cluster
+  Read:  35k receive/s; visibility lock update = 35k random writes on index
+         + 35k delete/s = 70k random IOPS on in-flight tracker
+  Sequential write (NVMe 1GB/s): 35 MB/s << 1 GB/s → write-throughput fine on 1 node
+  Random IOPS (NVMe 500k): 70k IOPS << 500k → fine on 1 node
+  With 3× replication: 3 storage nodes per host set
+
+Server count:
+  Frontend servers:  35k req/s ÷ 10k per server = 4 (run 10–15 for HA + AZ spread)
+  Storage nodes:     3 per host set × N host sets (AWS runs many host sets per queue at scale)
+  In-flight tracker: Redis cluster, 3 nodes (visibility lease store)
+  Metadata service:  3–5 nodes (queue config, rarely changes)
 ```
 
 ---
@@ -322,3 +337,48 @@ Rarely used — HTTP/gRPC better for synchronous RPC. SQS RPC: latency > 100ms.
 | DLQ | Separate queue after N failures | Isolate poison pills; don't block healthy messages |
 | Long polling | WaitTimeSeconds=20 | Reduce empty receives; lower cost; lower latency |
 | No replay | Messages deleted on ACK | Simple; use Kafka if replay needed |
+
+---
+
+## Interview Scenarios
+
+### "Messages being processed multiple times — consumers see duplicates"
+- Standard SQS: at-least-once delivery; duplicates expected during redrive and AZ failover
+- Fix: consumer must be idempotent — use `MessageId` as idempotency key on DB upsert
+- Or: switch to FIFO queue — exactly-once within 5-minute dedup window using `MessageDeduplicationId`
+- Monitor `NumberOfMessagesSent` vs downstream DB write count — divergence reveals duplicate rate
+
+### "Consumer processes a message but takes 45 minutes — visibility timeout expires, message redelivered"
+- Default visibility timeout: 30s — too short for long jobs
+- Fix option A: set visibility timeout at receive time: `ReceiveMessage(VisibilityTimeout=3600)`
+- Fix option B: consumer heartbeat — call `ChangeMessageVisibility` every 5 minutes to extend lease
+- Option B is safer: if consumer crashes, heartbeat stops → timeout expires → redelivery happens correctly
+
+### "Poison pill — one message always fails, blocks queue processing"
+- Consumer retries same message; hits `maxReceiveCount` (e.g., 5) → SQS moves it to DLQ automatically
+- DLQ alarm: CloudWatch alarm on `ApproximateNumberOfMessagesVisible > 0` → notify on-call
+- Inspect DLQ: parse failed message, fix bug in consumer code, redrive from DLQ back to source queue
+- Never delete DLQ messages without processing or investigation — they represent real work items
+
+### "Need strict FIFO ordering within a logical group (e.g., per-user event ordering)"
+- FIFO queue + `MessageGroupId = user_id` — SQS guarantees FIFO within each group
+- Different groups processed in parallel; same group processed sequentially by one consumer
+- Throughput limit: FIFO = 3,000 msg/s with batching (vs Standard = unlimited)
+- Trade-off: if one group has a slow consumer, it blocks only that group (no head-of-line for other groups)
+
+### "Traffic spikes 100× for 5 minutes (flash sale) — consumers overwhelmed"
+- SQS acts as buffer — messages pile up in queue rather than hitting backend directly
+- Consumer auto-scaling: Lambda or EC2 ASG scaled by `ApproximateNumberOfMessagesVisible` metric
+- Lambda + SQS: Lambda scales out consumers automatically up to concurrency limit
+- Set `maxBatchSize` on consumer: process 10 messages per invocation → reduce consumer overhead
+
+### "Constraint: messages must be processed in a specific order that depends on content (not just group)"
+- SQS FIFO + `MessageGroupId` provides ordering by group, not content-defined order
+- For content-dependent ordering: consumer must implement sequencing logic — include `sequenceNumber` in message; consumer buffers out-of-order messages, processes in sequence
+- Alternative: use Kafka (strict per-partition order) if content-defined ordering is central to the system
+
+### "Need to schedule a task 30 days in the future"
+- SQS `DelaySeconds` max = 15 minutes — too short
+- Pattern: write task to DynamoDB with `executeAt` timestamp; EventBridge Scheduler triggers Lambda at time T
+- Or: Step Functions `Wait` state — workflow pauses until specified time, then resumes
+- SQS-only workaround: re-enqueue message with delay each time it's received, until `executeAt` is reached (polling loop — expensive, not recommended)

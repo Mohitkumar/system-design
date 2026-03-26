@@ -138,6 +138,23 @@ Cache aside is the most common pattern (used by most Redis integrations). It giv
 - Each node holds 32 GB RAM (leaving headroom for OS + overhead)
 - 100 GB / 32 GB ≈ **4 data nodes** (add replicas on top)
 
+**IOPS:**
+- Redis: all ops in-memory → no disk IOPS for reads
+- Write persistence (AOF fsync=every-sec): ~1 disk write/sec per node (batched)
+- RDB snapshot: burst ~50k IOPS on snapshot node, short duration
+- Effective IOPS requirement: **negligible** (memory-bound, not I/O-bound)
+
+**Throughput:**
+- Single Redis node: ~100k–1M ops/sec (pipeline), ~80k ops/sec (single-threaded no pipeline)
+- Peak QPS = 12k reads/s + 1.2k writes/s = **~13k ops/sec**
+- 1 Redis node handles this; run **3 nodes** (primary + 2 replicas) per shard for HA
+- With 4 shards × 3 nodes = **12 Redis nodes total**
+
+**Server sizing (per cache node):**
+- CPU: 2–4 cores (Redis single-threaded for commands; I/O uses threads)
+- RAM: 32–64 GB
+- Network: 10 Gbps (at 100k ops/sec × 1 KB = 100 MB/s — well within NIC)
+
 ---
 
 ## High-Level Architecture
@@ -267,3 +284,50 @@ Keys are always strings (UTF-8). Values need a wire format:
 | Clustering | Redis Cluster (built-in) | Client-side consistent hashing |
 | Lua scripting | Yes | No |
 | Best for | Feature-rich caching, pub/sub, leaderboards, queues | Pure high-throughput key-value cache |
+
+---
+
+## Interview Scenarios
+
+### "Traffic grows 10×" (120k reads/s)
+- Current 4 nodes → need 40 nodes (memory stays same; CPU/network is now bottleneck)
+- Switch from vertical scaling to **Redis Cluster** (16–32 shards, 3 replicas each)
+- Add connection pooling at client (each app server holds 10–20 connections per shard)
+- Introduce **local in-process cache (Caffeine)** in front of Redis — absorb hot-key reads
+- Partition hot keys explicitly: `user:{id}:profile` → shard by `{id}` hash
+
+### "Cache hit rate drops to 60%" (cache thrash)
+- Root cause: working set bigger than cache, or TTL too short
+- Fix: profile access with `OBJECT FREQ` (LFU policy) → find which keys evicted early
+- Switch eviction from LRU → **LFU** (W-TinyLFU) — keeps genuinely hot keys
+- Increase cache size: add nodes or increase RAM per node
+- Add **read-through** layer: cache miss automatically fetches and populates — reduce thundering herd
+
+### "Need strong consistency (cache must never serve stale)"
+- **Write-through** policy: every DB write updates cache synchronously
+- **Version field** on cached objects: on read, compare version with DB; reject stale
+- Trade-off: 2× write latency (DB + cache); consider whether strict consistency is truly needed
+- Alternative: tolerate 1–2s stale, use short TTL + background refresh (most use-cases)
+
+### "Hot key problem: one user_id gets 10× normal traffic" (celebrity)
+- Local replica: cache popular key in **every app server's in-process cache** (Caffeine)
+- Key sharding: `hot_key#0` through `hot_key#9` → distribute reads across 10 Redis nodes; merge on read
+- **Read replica shards**: add 3–5 read-only Redis replicas for that shard; client load-balances reads
+
+### "Redis node crashes mid-write"
+- Without persistence: data lost for that shard until replica promotes
+- With AOF (fsync=everysec): lose at most 1s of writes
+- Use **Redis Sentinel** (automatic failover < 30s) or **Redis Cluster** (automatic slot failover)
+- Application: retry on `ConnectionError` with exponential backoff (idempotent reads are safe)
+
+### "Cache vs DB consistency: write to DB succeeds but cache update fails"
+- **Cache-aside (lazy invalidation)**: delete cache key on write → next read repopulates
+- Never update cache on write failure — stale > inconsistent
+- Use **TTL as safety net**: even if invalidation missed, key expires within TTL window
+- **Transactional outbox + CDC**: DB write triggers event → consumer invalidates cache (eventual but reliable)
+
+### "Constraint change: data must persist across restarts"
+- Switch from Memcached → Redis with AOF + RDB persistence
+- AOF (append-only file) + fsync=everysec: at most 1s data loss on crash
+- Trade-off: 10–30% performance reduction vs no persistence
+- For full durability: use Redis as write-through cache backed by a durable store

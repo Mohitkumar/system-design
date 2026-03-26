@@ -25,6 +25,22 @@ Peak QPS: 12k × 3 = 36k QPS (80:20 rule)
 Redis key per user: user_id + window = ~50 bytes key
 Counter value: 8 bytes
 Total keys in memory (1hr window): 10M × 58 bytes ≈ 580 MB  ← fits in single Redis node
+
+IOPS:
+  Every request = 1 Redis INCR (atomic) + 1 EXPIRE (on first request in window)
+  Peak: 36k req/s → 36k Redis ops/s
+  Redis is memory-only → 0 disk IOPS for counter ops
+  AOF persistence (fsync=every-sec): 1 batch disk write/sec — negligible
+  Rule cache lookup: in-process (0 disk IOPS); DB refresh every 60s = ~1 DB read/min
+
+Server count:
+  Redis (counter store): 1 primary handles 36k ops/s easily (Redis = 100k+ ops/s)
+                         Run 3 nodes (primary + 2 replicas) for HA → Redis Sentinel
+  API gateway nodes:     36k req/s ÷ 10k req/server = 4 (run 6–8 with headroom)
+  Rules DB (PostgreSQL): 1 primary + 1 read replica (low QPS — config reads only)
+
+Network overhead per request: 1 Redis round-trip ≈ 0.5–1ms (same-DC)
+Total added latency: < 2ms per request (well within 5ms SLO)
 ```
 
 ---
@@ -383,3 +399,50 @@ Client → CDN ──────────┤
 | Rule storage | DB + local cache (60s TTL) | Fast lookup, tolerate stale rules |
 | Failure mode | Fail open | Availability > precision under failure |
 | Identity | User ID (JWT) > API key > IP | Most granular → fairest limiting |
+
+---
+
+## Interview Scenarios
+
+### "Redis goes down — should rate limiter block all traffic?"
+- Fail open: allow all requests when Redis is unavailable → better UX, risk of abuse during outage
+- Fail closed: block all requests → safe but causes outage for all users
+- Standard choice: **fail open** for rate limiting (it's a performance layer, not security gate)
+- Implementation: catch Redis connection error → log + alert → return `allowed=true` with degraded flag
+- Circuit breaker: if Redis error rate >10% over 30s → switch to local in-process counter (approximate)
+
+### "Single Redis becomes a bottleneck at 1M req/sec"
+- Single Redis: ~1M ops/sec ceiling (single-threaded command execution)
+- Fix: Redis Cluster — hash tag `{user_id}` ensures same user always hits same slot/node
+- Or: local budget approach (Cloudflare pattern) — each app server holds 10% of user's budget; sync every 100ms; reduces Redis calls 10×
+- Separate Redis cluster per rate-limit tier: critical API limits on dedicated cluster; background job limits on shared cluster
+
+### "Rate limiter needs to enforce different limits per user tier (free: 100/hr, paid: 10k/hr)"
+- Store tier in JWT claims or a fast user-profile cache (Redis hash)
+- On each request: `tier = get_tier(user_id)` → `limit = rules[tier]` → check counter
+- Rule refresh: cache rules in-process with 60s TTL → tolerate stale rules for 1 minute (acceptable)
+- Dynamic updates: push rule changes to Redis pub/sub → all nodes invalidate local cache immediately
+
+### "Attacker bypasses per-IP limit using 10,000 different IPs (distributed attack)"
+- Per-IP limits don't stop distributed attacks; need per-user + per-behavioral pattern
+- Add global rate limit: if total RPS from `/login` endpoint >10k/s → circuit break at API gateway
+- Behavioral fingerprinting: limit by `(user_agent, ASN, request_pattern)` not just IP
+- CAPTCHA challenge: trigger for suspicious patterns before hitting actual rate limit
+- DDoS: escalate to WAF/Cloudflare — not solvable purely at rate limiter layer
+
+### "Need rate limiting that carries over (unused quota should not roll over)"
+- Fixed window: quota resets every hour regardless → no rollover (standard behavior)
+- Token bucket: tokens accumulate up to bucket capacity (burst allowance) — this IS rollover
+- To prevent rollover in token bucket: set `bucket_capacity = refill_rate × 1 interval` → tokens never build up beyond 1 window's worth
+
+### "Constraint: rate limiter must add <1ms latency (current Redis adds 2ms)"
+- Redis RTT = 1–2ms on same-DC; hard to get below without eliminating the round-trip
+- Fix: local in-process counter + async sync → 0 network latency on hot path; sync every 500ms
+- Accept slight overcounting (up to `sync_interval × rate`) — for most APIs, this is acceptable
+- Ultra-low latency option: kernel-level rate limiting (eBPF/XDP) → sub-microsecond, but complex to deploy
+
+### "Constraint: rate limit must be per organization (all users under one org share a pool)"
+- Key change: `rl:{org_id}:{endpoint}:{window}` instead of `rl:{user_id}:...`
+- Org-level limits require org_id from JWT or user-to-org lookup (cache org membership)
+- Hierarchical limits: enforce both `per-user` AND `per-org` in same request using Lua script with two INCR calls
+- Fair queuing within org: each user gets a sub-quota; org limit is the ceiling — prevents one user exhausting org pool

@@ -51,6 +51,19 @@
 - **Storage:** 1B msg/day × 1 KB = **1 TB/day**. Retain for 4 days (SQS default) → **4 TB** raw; with 3× replication → **12 TB**
 - **Bandwidth:** 46K msg/sec × 1 KB = **~46 MB/sec** inbound; similar outbound
 
+**IOPS:**
+- Write: sequential append to WAL → 1 sequential write per message = 46k writes/sec
+- Sequential write throughput (NVMe SSD): ~1 GB/s = ~1M 1KB writes/sec → **1 disk handles the load**
+- Read: long-poll consumers read from page cache (in-memory) → minimal disk IOPS
+- Visibility timeout sweep: background scan ~1k IOPS on index store
+- Total disk IOPS: **~50k sequential writes/sec** (well within 1 NVMe SSD at 500k IOPS)
+
+**Server count:**
+- Frontend servers: stateless; peak 46k req/sec ÷ 10k req/server = **5 frontend servers**
+- Storage nodes: 46 MB/s write × 3 replicas = 138 MB/s; NVMe handles 1 GB/s → **3–5 storage nodes** (1 per replica + spare)
+- In-flight tracker: lightweight Redis cluster, **3 nodes** (primary + 2 replicas)
+- Metadata service: **3 nodes** (ZooKeeper/etcd quorum)
+
 ---
 
 ## High-Level Architecture
@@ -287,3 +300,50 @@ Partition node skips messages where `now < delayUntil` during `receiveMessage` s
 | Failure recovery | ISR election + visibility timeout re-enqueue | No single point of failure |
 | Delayed messages | `delayUntil` field + background sweeper | No separate queue needed |
 | Failed messages | DLQ after N failures | Isolates poison pills from healthy traffic |
+
+---
+
+## Interview Scenarios
+
+### "Require strict message ordering across all producers"
+- Per-queue FIFO is expensive (single partition = single throughput ceiling)
+- Instead: partition by `messageGroupId` — strict order within a group, parallel across groups
+- If truly global order required: single partition, accept throughput cap ~5k msg/s
+- Trade-off: global FIFO vs horizontal scale — almost always partition by entity key
+
+### "Consumer falls behind — queue depth grows to 100M messages"
+- Root cause: consumer throughput < producer throughput
+- Fix: increase consumer parallelism — add consumers (up to # partitions limit)
+- If consumer count already = partition count: add partitions → rebalance consumer group
+- Short-term: throttle producers or increase visibility timeout to prevent re-enqueue storm
+- Long-term: add consumers + scale storage nodes; monitor `ApproximateAgeOfOldestMessage`
+
+### "Need exactly-once delivery"
+- At-least-once is the default — consumer must be idempotent (idempotency key on DB write)
+- For exactly-once: FIFO queue + `MessageDeduplicationId` (SHA-256 of body) → 5-minute dedup window
+- Producer-side: idempotent producers (sequence number per producer)
+- Consumer-side: transactional outbox — write to DB + delete message in same transaction
+- True EOS (Kafka): enable `enable.idempotence=true` + `transactional.id`
+
+### "Message processing takes too long — visibility timeout keeps expiring"
+- Increase visibility timeout to cover p99 processing time + buffer
+- Or: consumer calls `ChangeMessageVisibility` heartbeat every 30s during long processing
+- Monitor `ApproximateNumberOfMessagesNotVisible` — spike = visibility timeout too short
+- Add DLQ with `maxReceiveCount=3` — avoid infinite redelivery loop on poison pills
+
+### "Traffic grows 10× (460k msg/sec)"
+- Scale frontend nodes: stateless → add horizontally
+- Add partitions: 10 → 100 partitions (each ~4.6k msg/s, within single-partition throughput)
+- Add storage nodes: more partitions → more leaders → spread across more brokers
+- Increase replication factor from 3 → 5 if durability requirement increases with scale
+
+### "Constraint: messages must survive region failure"
+- Switch from single-region replication to cross-region async replication
+- Dual-region active-passive: primary region replicates to standby; RTO ~30s on failover
+- Active-active: producers write to nearest region; consumers can read from either; risk of duplicate delivery across regions
+- Use Global SQS queues (SNS fan-out to queues in multiple regions) for simpler fan-out case
+
+### "Need delayed message delivery (schedule for future)"
+- Add `delayUntil` timestamp to message; store in a delay bucket (sorted by timestamp)
+- Background sweeper scans delay buckets every second; moves ready messages to active queue
+- SQS: built-in `DelaySeconds` up to 15 min; for longer delays, use Step Functions or EventBridge

@@ -44,6 +44,22 @@ Storage:
   50M users × 10 items × 1 KB = 500 GB
   Growth: 5.8k writes/s × 86,400s × 1 KB ≈ 500 GB/day new data
   5yr:    500 GB/day × 1,825 = ~912 TB
+
+IOPS:
+  Write: 17k WCU/s peak; each WCU = 1 write to leader + replicate to 2 followers
+         Leader write: 17k random writes/s (B-tree in-place updates)
+         WAL: 17k sequential writes/s (for crash recovery)
+         Per-partition: 1,000 WCU/s max → 17 partitions minimum for write load
+  Read:  175k RCU/s peak (eventually consistent hits any replica)
+         B-tree read: ~3–4 random IOs per cache miss; assume 5% miss = 8.75k random IOPS
+         Per-partition: 3,000 RCU/s max → 58 partitions minimum for read load
+  NVMe SSD per node: 500k IOPS → single node handles both read+write IOPS easily
+  Bottleneck: throughput capacity (RCU/WCU limits) not raw IOPS
+
+Server count (DynamoDB is fully managed — for self-hosted equivalent):
+  Storage nodes: 912 TB / 10 TB per node = ~92 nodes; add replication = ~276 nodes
+  Partition manager: 3–5 nodes (metadata routing)
+  In practice (AWS DynamoDB): thousands of storage nodes globally per cell
 ```
 
 ---
@@ -438,3 +454,50 @@ DAX latency: **microseconds** (RAM) vs DynamoDB **single-digit ms**.
 | Global Tables | Active-active with regional ownership | Avoid conflict resolution complexity |
 | Streams | NEW_AND_OLD_IMAGES for audit; KEYS_ONLY for cache invalidation | Minimize stream size |
 | Hot partition fix | Write sharding (random suffix) or adaptive capacity | Distribute writes; DynamoDB handles reads adaptively |
+
+---
+
+## Interview Scenarios
+
+### "Hot partition — one seller_id gets 80% of all reads (flash sale)"
+- DynamoDB throttles partitions exceeding their WCU/RCU allocation
+- Fix option A: DAX in front of DynamoDB — cache reads; hot partition reads served from DAX, not DynamoDB
+- Fix option B: write sharding — store item as `seller_id#0` through `seller_id#9`; read all shards and merge
+- Fix option C: GSI overloading — route reads to a GSI with different partition key that spreads the hot data
+- Adaptive capacity handles moderate hot partitions; extreme hot keys require explicit sharding
+
+### "Need to query by multiple access patterns (by email, by phone, by region)"
+- DynamoDB requires knowing access patterns at design time; each GSI supports one access pattern
+- For 3 access patterns: create 3 GSIs (email → PK, phone → PK, region → PK)
+- GSI cost: same WCU/RCU as base table; 3 GSIs = ~4× the write cost for heavily written items
+- Alternative: write to DynamoDB Streams → downstream sync to Elasticsearch for flexible querying
+
+### "Transaction fails halfway through — item A updated, item B not updated"
+- DynamoDB Transactions are all-or-nothing: if any condition fails, entire `TransactWriteItems` rolls back
+- Use `ConditionExpression` on each item to detect conflicts before write
+- Idempotency: include `ClientRequestToken` on `TransactWriteItems` → safe to retry without double-apply
+- 25-item limit per transaction: for larger batches, use saga pattern (sequence of conditional writes + compensating actions)
+
+### "Table grows to 10 TB — cost becomes prohibitive"
+- Analyze access patterns: items accessed <1× per month are paying full Standard rate unnecessarily
+- Enable DynamoDB Standard-IA (Infrequent Access) storage class → ~60% storage cost reduction
+- TTL: set expiration on transient items (sessions, OTPs, temp tokens) → automatic free deletion
+- Archive cold data: DynamoDB → S3 via DynamoDB export; query with Athena; delete from DynamoDB
+
+### "Need to sync DynamoDB to Elasticsearch for full-text search"
+- Enable DynamoDB Streams (NEW_AND_OLD_IMAGES)
+- Lambda trigger on stream → writes to Elasticsearch / OpenSearch
+- Lag: near-real-time (<1s typically); Lambda invoked per shard of stream
+- On initial bootstrap: DynamoDB export to S3 → bulk import to Elasticsearch → then switch to stream
+
+### "Constraint: query must return results sorted by timestamp"
+- DynamoDB: items within a partition sorted by sort key
+- Design: `PK = entity_type#entity_id`, `SK = timestamp#uuid` → range scan returns time-ordered items
+- Reverse sort: scan with `ScanIndexForward=false` → newest first
+- Cross-partition time sort impossible natively → use GSI with `PK = entity_type`, `SK = timestamp` — but this puts all items of a type in one partition (hot spot at scale)
+
+### "Global Tables — users in EU write data but see US users' stale data"
+- Global Tables use last-writer-wins (LWW) with DynamoDB timestamps; async replication lag ~1–2s
+- If EU user reads immediately after US user writes: may see stale data during replication lag
+- Fix: regional ownership — each user "owns" a home region; always read from home region; replicate for disaster recovery only
+- For truly consistent global reads: direct all reads to one canonical region (defeats geo-distribution purpose)

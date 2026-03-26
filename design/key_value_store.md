@@ -336,6 +336,24 @@ Combines physical time (NTP) with a logical counter:
 - **Storage:** 500M × 10 KB = **5 TB** raw; 3× replication = **15 TB**
 - **Nodes:** 15 TB / 2 TB per node (leaving headroom) = **~8 nodes** storage; more for throughput
 
+**IOPS (LSM-tree storage engine):**
+- Write IOPS: 1 sequential write per op (WAL append) → 100k writes/sec × 1 = **100k write IOPS** (sequential)
+- Read IOPS: bloom filter + sparse index → ~2–4 random reads per cache miss
+  - Assume 10% cache miss rate: 150k reads/sec × 10% × 3 IOs = **45k random read IOPS**
+- Total: ~145k IOPS; NVMe SSD = 500k IOPS → **1 NVMe per storage node sufficient**
+- Compaction burst: up to 2× write IOPS during compaction; schedule off-peak or rate-limit
+
+**Server count:**
+| Layer | Count | Sizing | Reason |
+|-------|-------|--------|--------|
+| Coordinator / API | 5 | 16 cores, 32 GB | 150k req/sec ÷ 30k per server |
+| Storage nodes | 12–15 | 16 cores, 64 GB RAM, 2TB NVMe | 15 TB ÷ 2TB + 3× replication spread |
+| ZooKeeper / etcd | 3–5 | 8 cores, 16 GB | Quorum for membership/config |
+
+**Memory per storage node (RocksDB block cache):**
+- Cache 10% of hot data: 500 GB ÷ 12 nodes = 42 GB → set block cache to **32–48 GB per node**
+- Bloom filter overhead: ~10 bits/key × 42M keys/node ÷ 8 = ~52 MB per node (negligible)
+
 ---
 
 ## High-Level Architecture
@@ -495,3 +513,49 @@ Efficient — only diverged keys are exchanged, not the full dataset.
 | Failure detection | Gossip protocol | Decentralized; scales to thousands of nodes |
 | Stale replica repair | Hinted handoff + Merkle anti-entropy | Short outage: handoff; long drift: Merkle sync |
 | Clock | Hybrid Logical Clocks | Close to real time; survives NTP corrections |
+
+---
+
+## Interview Scenarios
+
+### "Require strong consistency for financial data"
+- Switch from AP (W=2, R=2, N=3) to CP: set W=3 (quorum write to all replicas before ack)
+- Or use single-leader per key range (like etcd/ZooKeeper) — writes go to leader, linearizable reads from leader
+- Trade-off: write latency increases (wait for slowest replica); availability drops during minority partition
+- For payments: use CP store (etcd) or add compare-and-swap (`CAS`) operations to prevent double-spend
+
+### "Hot key — one celebrity user_id gets 1000× normal traffic"
+- Local in-process cache (L1) on every app server: serve from Caffeine/Guava before hitting KV store
+- Shard the key: `user_1234#0` through `user_1234#9` → write to all, read from random shard → 10× throughput
+- Read from any replica (not just W replicas) for hot reads — add read-only replicas for hot keys
+- Detect with `OBJECT FREQ` (LFU stats) or access log sampling; apply targeted fix per hot key
+
+### "Large value storage — storing 50 MB video metadata blobs"
+- KV store is optimized for small values (<10 KB); large values amplify compaction, GC, and network
+- Store large value in S3/blob store; KV stores only a pointer (`s3://bucket/key`)
+- If must store inline: use chunking — split blob into 1 MB chunks, store as `key#0`..`key#N`; reassemble on read
+- Use separate LSM column family or separate cluster for large values to isolate compaction overhead
+
+### "Traffic grows 10× — 120k writes/sec"
+- Current: 5 nodes handling 12k writes/s. Need 10× → 50 nodes
+- Consistent hashing with vnodes: adding nodes remaps only `1/N` keys — minimal disruption
+- Add nodes gradually (5 at a time); wait for data rebalance before adding more
+- If write amplification is bottleneck: tune RocksDB compaction (`level_compaction_dynamic_level_bytes=true`)
+
+### "Node failure during write — W=2, N=3, 1 node down"
+- Write can still complete with W=2 (quorum met by 2 remaining nodes)
+- Hinted handoff: coordinator stores the write locally with a hint for the failed node
+- When failed node recovers, coordinator replays hints → eventual consistency restored
+- Monitor `PendingHints` metric; if node down >1hr, trigger Merkle anti-entropy sync on recovery
+
+### "Need range queries — find all keys from user_100 to user_200"
+- Hash-based partitioning (DynamoDB, Redis) breaks range queries — keys scatter across all partitions
+- Fix: switch to range-based partitioning (like HBase, TiKV, CockroachDB) — keeps ranges on same node
+- Or: maintain a secondary sorted index (GSI in DynamoDB, materialized view in Cassandra)
+- Trade-off: range partitioning introduces hot spots on monotonic keys (auto-increment IDs) → use UUIDs or reversed keys
+
+### "Constraint: must survive full datacenter failure"
+- Multi-region replication: async replication to secondary region (RPO = replication lag, ~seconds)
+- Active-active: both regions accept writes; conflict resolution via LWW or vector clocks
+- Active-passive: primary region handles all writes; secondary is read-only standby; failover in <30s
+- Quorum across regions: W=2 (one local + one remote) — strong consistency but +RTT write latency

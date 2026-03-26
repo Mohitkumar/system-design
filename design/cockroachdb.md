@@ -187,6 +187,36 @@ nodes_needed = ranges × 3 replicas / replicas_per_node
               (typical: 50–200 ranges per node)
 ```
 
+### IOPS
+```
+Write IOPS (per node, Raft leader):
+  Raft WAL:      sequential write per proposal = write_QPS sequential IOPS
+  RocksDB write: write_QPS random IOPS (LSM MemTable flush + compaction)
+  Intent write:  1 extra write per tx (intent + commit record)
+  Example: 5k writes/s/node → 10k IOPS (WAL + RocksDB) + 20% compaction = ~12k IOPS/node
+  NVMe SSD: 500k IOPS → headroom for 40× more writes per node
+
+Read IOPS (lease holder):
+  Strong read (from lease holder): 0 disk IOPS if RocksDB block cache hit (~99%)
+  Cache miss: B-tree height ~3 levels → 3 random IOPS per miss
+  Assume 1% miss: read_QPS × 1% × 3 = ~30 IOPS per 1k read QPS
+```
+
+### Server Count
+```
+Example: 1M row table, 10 KB avg row, 5k write QPS, 50k read QPS
+
+Total data:     1M × 10 KB × 1.2 (MVCC) × 3 (replicas) = 36 GB → small
+Ranges:         36 GB / 512 MB = 72 ranges × 3 replicas = 216 replica-ranges
+Nodes (200/node): ceil(216 / 200) = 2 nodes minimum; run 3 for fault tolerance
+
+At 50k write QPS (total cluster):
+  50k ÷ 3 nodes = 17k writes/node → ~34k IOPS/node (WAL + LSM)
+  NVMe handles it; run 3–5 nodes to stay under 50% IOPS capacity
+
+Node sizing: 16–32 cores, 64–128 GB RAM, 2× NVMe SSD, 25 Gbps NIC
+```
+
 ### Latency
 | Operation | Typical |
 |-----------|---------|
@@ -208,3 +238,49 @@ nodes_needed = ranges × 3 replicas / replicas_per_node
 | Coalesced heartbeats | O(nodes) not O(ranges) heartbeat traffic |
 | Two-level meta indirection | Scale key lookup to 4 exabytes |
 | SSI default | Strong consistency without the 2PL blocking overhead |
+
+---
+
+## Interview Scenarios
+
+### "Write latency spikes during cross-region transactions"
+- Cross-region write = RTT/2 (e.g., 50ms US→EU) per Raft round-trip
+- Fix: locality-aware table placement — use `LOCALITY REGIONAL BY ROW` (CockroachDB feature) → each row has a preferred region; writes commit locally
+- Avoid cross-region 2PC: design schema so related rows live in same region
+- For global tables with low write contention: global table configuration → single region owns writes; others serve reads
+
+### "Hot range — one range (key range) handling all writes (monotonic ID hot spot)"
+- Monotonic auto-increment PKs concentrate all inserts in the last range
+- Fix: use UUID v4 or ULIDs as primary key → random distribution across ranges
+- Or: hash-prefix encoding (CockroachDB `HASH SHARDED INDEXES`) → distributes sequential inserts across N buckets
+- Monitor: CockroachDB Console shows `QPS per range`; a range at 10× average = hot spot
+
+### "SSI causes too many transaction restarts under high contention"
+- SSI restarts happen when write conflicts with a recent read (timestamp cache hit)
+- Fix: prioritized retry with exponential backoff; high-priority transactions win conflicts
+- For predictable contention (counter increments): use `SELECT FOR UPDATE` to serialize explicitly → converts SSI to pessimistic locking for that row
+- Reduce contention by design: avoid single-row hotspots (use sharded counters, aggregate writes)
+
+### "Read latency from non-leaseholder nodes"
+- Read from non-leaseholder: must forward to leaseholder → extra network hop
+- Fix: route reads to leaseholder explicitly (CockroachDB client libraries do this automatically via node map)
+- For stale reads: `AS OF SYSTEM TIME '-10s'` → served by any follower, no leaseholder needed → 1ms instead of 5ms for cross-region reads
+- Follower reads: enable with `SET CLUSTER SETTING kv.closed_timestamps.target_duration = '3s'`
+
+### "Need to survive 2 simultaneous datacenter failures (5-region setup)"
+- Default: 3 replicas, survive 1 failure
+- Fix: 5 replicas across 5 regions; Raft quorum = 3/5 → survive any 2 failures
+- Write latency: must wait for 3rd ACK across regions → increases p99; use `ZONE CONSTRAINT` to prefer nearby replicas for quorum
+- Survival goals: `ALTER DATABASE ... SURVIVE REGION FAILURE` (CockroachDB) handles replica placement automatically
+
+### "Constraint: run CockroachDB on fewer nodes to reduce cost"
+- Minimum viable CockroachDB: 3 nodes (Raft quorum = 2)
+- Each node hosts multiple ranges; default 200 ranges/node is fine; tune `range_max_bytes` if needed
+- Reduce storage: enable column compression; use appropriate storage class per data tier
+- Right-size nodes: profile actual IOPS per node before sizing — CockroachDB is CPU-bound for SQL, not always I/O-bound
+
+### "Traffic grows 10× — need to scale without downtime"
+- Add nodes: CockroachDB rebalances ranges automatically → no manual sharding required
+- Scale reads: increase replica count per range → more leaseholders → more read throughput
+- Scale writes: more ranges → more range leaders → more write throughput (horizontal partitioning)
+- Zero-downtime: rolling node addition; rebalancer runs in background; client retries handle `MOVED` gracefully

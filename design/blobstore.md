@@ -41,6 +41,20 @@ Bandwidth:
   Write: 115 writes/s × 50 MB = ~5.7 GB/s ingress
   Read:  1,150 reads/s × 50 MB = ~57 GB/s egress (before CDN)
   After CDN offload (80%): ~11 GB/s origin egress
+
+IOPS (chunk servers):
+  Each 50 MB object = 1 chunk write (sequential, not random)
+  Write IOPS: 115 objects/s × 3 replicas = 345 sequential writes/s
+  Sequential write throughput: 115 × 50 MB × 3 = 17 GB/s across cluster
+  Per chunk server (NVMe, 2 GB/s): 17 GB/s ÷ 2 GB/s = ~9 chunk servers for writes
+  Read IOPS: 1,150 reads/s; byte-range = partial chunk → ~2–3 IOs per read
+  Random read IOPS needed: 1,150 × 3 = ~3,500 IOPS → trivial for SSDs
+
+Server count:
+  Frontend servers:  peak 3.5k req/s ÷ 5k req/server = 1 (run 5 for HA)
+  Chunk servers:     17 GB/s write ÷ 2 GB/s per server = 9; add 3× replication spread → 15–20
+  Metadata servers:  Cassandra cluster, 5–7 nodes (billions of objects, strong reads)
+  CDN PoPs:          Offloads 80% egress — reduces origin to 11 GB/s
 ```
 
 ---
@@ -420,3 +434,51 @@ After 7 years → Expire / Delete
 | Large upload | Multipart | Parallelism + resumability |
 | Client upload | Pre-signed URL (direct to storage) | Server never handles bytes → massive throughput |
 | Consistency | Strong single-region, eventual cross-region | Practical balance of latency vs correctness |
+
+---
+
+## Interview Scenarios
+
+### "Upload a 100 GB file"
+- Single PUT times out; network interruption loses all progress
+- Use multipart upload: split into 64 MB parts (1562 parts), upload in parallel (16 concurrent)
+- Each part is independently retried on failure; only failed part re-uploads, not entire file
+- Complete multipart request assembles parts atomically on server side
+- Client-side: pre-calculate ETags per part; verify after upload; retry any mismatched part
+
+### "Traffic grows 10× — 10M PUTs/day (120 PUTs/sec peak)"
+- Metadata store (Cassandra): partition key = account+bucket → may hot-spot on prolific accounts
+- Fix: add `chunk_id` or random suffix to partition key to distribute writes
+- Storage nodes: add nodes, consistent hashing remaps minimal chunks
+- Hot bucket (e.g., popular public bucket): add CDN (CloudFront) in front — cache GETs, bypass storage for reads
+
+### "Must serve objects with <50ms p99 latency globally"
+- Default: reads from origin datacenter → 150–300ms for cross-continental users
+- Fix: CDN caching — serve from edge PoP near user; cache-hit latency <10ms
+- For dynamic/private objects: pre-signed URL + CDN with signed cookies (still bypasses origin on cache hit)
+- Origin shield: single region fetches from origin, all edge nodes fetch from shield → reduces origin load
+
+### "Object must be deleted immediately (GDPR right to erasure)"
+- Soft-delete marks metadata as deleted but bytes remain until GC → may not meet GDPR deadline
+- Fix: hard delete path — immediately remove metadata entry AND schedule chunk deletion (or delete synchronously)
+- CDN complication: cached copy may still be served after metadata delete
+  - Solution: CDN invalidation API (immediate, but costs money) or short TTL (<1hr) on sensitive objects
+- Cross-region replication: send delete to all replicas synchronously before returning 200
+
+### "Need to store 1 billion small objects (<10 KB each)"
+- 1B objects × 10 KB = 10 TB data; metadata overhead = 1B × 500 bytes = 500 GB metadata
+- Metadata at this scale requires careful sharding — partition by `murmur3(account+bucket+key) % N`
+- Small object problem: chunk overhead (64 MB chunks) wastes space; pack small objects into a single chunk using a packing manifest
+- Alternatively: store small objects inline in metadata row (for <1 KB objects)
+
+### "Constraint: objects must survive 2 simultaneous AZ failures"
+- Default: 3× replication across 3 AZs → survives 1 AZ loss
+- Fix: increase replication to 5 AZs, or switch to erasure coding with higher redundancy (e.g., 8+4 = 12 shards, survive 4 failures)
+- Cost: erasure coding 8+4 = 1.5× overhead vs 3× replication = 3× overhead — erasure coding wins on cost
+- Write path: parallel write to all 5 AZs; require 4/5 ACKs before returning success
+
+### "Constraint: reduce storage cost for cold data (accessed <1× per year)"
+- Move to Glacier tier: tape-backed or deep archive; retrieval takes minutes–hours
+- Lifecycle policy: transition to Glacier after 90 days of no access
+- Erasure coding on cold tier: 6+3 = 1.5× overhead vs Standard 3× = 50% cost reduction
+- Further: Glacier Deep Archive at ~$0.00099/GB/month vs Standard ~$0.023/GB/month = 23× cheaper

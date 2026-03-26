@@ -162,7 +162,25 @@ Replace the epoch in Snowflake with a vector clock counter:
 - 1B IDs/day ÷ 86,400 sec = **~11,574 IDs/sec average**
 - **80/20 rule:** 80% of requests arrive in 20% of the day (peak ~5 hours) → peak = (1B × 0.8) / (0.2 × 86,400) ≈ **~46K IDs/sec**
 - Each Snowflake worker: 4096 IDs/ms = **4M IDs/sec**
-- Workers needed: 46,000 / 4,000,000 ≈ **1 worker is enough**; run ~5–10 for HA and geo-distribution
+- Workers needed: 46,000 / 4,000,000 ≈ **1 worker is enough**; run **5–10 workers** for HA and geo-distribution
+
+**IOPS:**
+- ID generation is **pure in-memory** (bit manipulation on timestamp + counter)
+- Zero disk IOPS per ID generated
+- Worker ID assignment: 1 etcd read on startup (one-time)
+- Network: 46k req/sec × ~50 bytes/response = **~2.3 MB/s** — trivial
+
+**Server count:**
+| Component | Count | Sizing | Reason |
+|-----------|-------|--------|--------|
+| ID generator workers | 5–10 | 2 cores, 4 GB RAM | Stateless; CPU-bound not I/O-bound |
+| Load balancer | 2 | L7 (round-robin) | HA for worker fleet |
+| etcd (worker ID lease) | 3 | 4 cores, 8 GB | Quorum for worker ID assignment |
+
+- Each worker: single goroutine/thread handles sequence; multi-thread needs lock → keep single-threaded
+- At 46k req/sec per worker, 1 CPU core at ~1M simple ops/sec → **CPU is never the bottleneck**
+- Bottleneck in practice: **clock resolution** (1ms granularity → 4096 max/ms)
+  - At 4M IDs/sec ceiling per worker, 10 workers → **40M IDs/sec** max throughput
 
 ---
 
@@ -300,3 +318,42 @@ Workers must have unique IDs. Two approaches:
 | Clock backward | Spin-wait / alert | Safety over availability on clock issues |
 | Throughput | 4096/ms per worker | Exceeds any realistic single-service requirement |
 | Epoch | Custom (e.g. 2024-01-01) | Maximizes the 69-year lifespan |
+
+---
+
+## Interview Scenarios
+
+### "Clock skew — NTP jumps time backward by 500ms"
+- Snowflake: spin-wait until `currentTime >= lastTimestamp`; do NOT generate IDs during backward clock
+- For large skew (>1s): alert on-call + stop the worker; restart after clock stabilizes
+- Detection: monitor `clock_skew_ms` metric per worker; set alert at >10ms
+- Prevention: use `CLOCK_MONOTONIC` for sequence; sync with `CLOCK_REALTIME` only for epoch bits
+
+### "Worker ID exhaustion — all 1024 worker IDs in use"
+- Root cause: old workers not releasing IDs (crash without cleanup, or leaked leases)
+- Fix: short TTL leases (60s) in etcd; dead worker's ID reclaimed automatically on lease expiry
+- Monitoring: alert when `available_worker_ids < 50`; scale out ID tier before exhaustion
+- If need more workers: trade 1 sequence bit for 1 worker bit → 2048 workers, 2048 IDs/ms (still ~2M IDs/sec per worker)
+
+### "Need IDs that sort by insertion order (user wants to paginate by ID)"
+- Snowflake IDs are already time-sorted: higher ID = later creation time (ms granularity)
+- For sub-ms sort within same tick: sequence number preserves order within a worker, but cross-worker order within same ms is not deterministic
+- If strict total order needed: use a distributed sequence (Redis INCR) — but this creates a bottleneck
+- Alternative: ULID (Universally Unique Lexicographically Sortable Identifier) — 48-bit time + 80-bit random, lexicographically sortable
+
+### "ID must be globally unique across regions"
+- Snowflake worker IDs must be region-scoped: assign datacenter_id (5 bits) + worker_id (5 bits) — separates ID spaces by region
+- Each region's workers generate IDs independently; no cross-region coordination needed
+- Risk: if same worker_id is assigned in two regions → duplicate IDs; prevent via centralized worker ID registry (global etcd)
+
+### "Constraint: IDs must be unpredictable (security — can't enumerate resources)"
+- Snowflake IDs are guessable (timestamp + worker + sequence) — bad for security-sensitive resources
+- Use UUID v4 (random 122 bits) for resource IDs that must not be enumerable
+- Hybrid: generate Snowflake for internal primary key; expose UUID v4 as external API identifier
+- Or: HMAC-sign the Snowflake ID with a secret → opaque external ID that maps back internally
+
+### "Database becomes the bottleneck on ID generation"
+- Auto-increment DB sequences: single bottleneck, ~10k IDs/sec ceiling
+- Fix: batch allocation — worker requests a range (e.g., 1000 IDs) from DB; serves locally without DB per request
+- Range size tradeoff: large range = more IDs lost on crash; small range = more DB round trips
+- Snowflake approach eliminates DB entirely — preferred for high-throughput systems

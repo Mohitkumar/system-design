@@ -110,6 +110,25 @@ Each group maintains its own offset; one slow group doesn't affect others.
 
 **Brokers needed:** Each broker handles ~100 MB/sec disk I/O → **5 read brokers** minimum; with replication overhead, deploy **~10–15 brokers**.
 
+**IOPS:**
+- Write path: sequential append to partition log = throughput-bound not IOPS-bound
+- Inbound: 50 MB/s × 3 replicas = 150 MB/s sequential writes per broker
+- Read path: OS page cache serves hot segments → ~0 disk reads for recent data
+- Cold consumer (replay from old offset): random disk reads → ~5k IOPS per slow consumer
+- NVMe SSD: 1 GB/s sequential write, 500k IOPS random → **1 disk per broker handles write load**
+- Recommended: 2× NVMe per broker (RAID-0 striping or separate log + index disks)
+
+**Server count:**
+| Component | Count | Sizing |
+|-----------|-------|--------|
+| Kafka brokers | 10–15 | 32 cores, 128 GB RAM, 2× 2TB NVMe, 25 Gbps NIC |
+| ZooKeeper / KRaft | 3 | 8 cores, 16 GB RAM, SSD |
+| Schema Registry | 2 | 4 cores, 8 GB RAM |
+| Consumer groups | Scales with partitions | 1 consumer instance per partition max |
+
+**Partition count target:** partitions = max(desired_parallelism, peak_QPS / throughput_per_partition)
+- 50k msg/sec ÷ 5k msg/sec per partition = **10 partitions minimum**; use **30–50 for headroom**
+
 ---
 
 ## High-Level Architecture
@@ -293,3 +312,49 @@ Fan-out:     each consumer GROUP gets its own copy of every message
 Replay:      seek to any offset within retention window
 Scale:       add partitions → more parallelism; add brokers → more storage + I/O
 ```
+
+---
+
+## Interview Scenarios
+
+### "New service needs to replay all historical events from day 1"
+- Kafka retains messages for configurable window (default 7 days, can be unlimited with `retention.bytes=-1`)
+- New consumer group starts with `auto.offset.reset=earliest` → reads from offset 0
+- If data older than retention: bootstrap from a snapshot (compacted topic or S3 export) + replay delta
+- Cost: storage grows linearly; use tiered storage (Kafka → S3 offload) for long-term retention at low cost
+
+### "Fan-out to 10,000 consumers — broker CPU spikes"
+- Kafka: broker sends one copy per fetch request per consumer; 10k consumers = 10k reads per message
+- Fix: introduce consumer tiers — broker → 10 aggregator consumers → 1000 consumers each
+- Or use Kafka + SNS fan-out: Kafka consumer forwards to SNS, which pushes to 10k endpoints
+- Optimize: ensure consumers use long-polling + batch fetch (`max.poll.records=500`) to amortize overhead
+
+### "Consumer group falls behind by hours — catch-up without affecting live consumers"
+- Consumer lag = end offset − committed offset per partition
+- Dedicated catch-up consumer group (separate `group.id`) — won't affect live group
+- Throttle catch-up rate: set `fetch.max.bytes` lower to not saturate broker I/O
+- Priority lanes: live consumer group reads from hot partitions; catch-up from cold (compacted topic)
+
+### "Traffic grows 10× (1M msg/sec)"
+- Current: 15 brokers × ~70k msg/s each → need to scale to 150 brokers or increase per-broker throughput
+- Add partitions: more partitions → more parallelism, more write bandwidth
+- NVMe per broker handles 1 GB/s sequential → message throughput ceiling is network, not disk
+- Producer side: increase batch size + linger time → fewer, larger writes per broker
+- Run Kafka on dedicated metal (not shared cloud VMs) at this scale for predictable tail latency
+
+### "Must guarantee message ordering across multiple topics (cross-topic transactions)"
+- Kafka EOS transactions: producer wraps multi-topic writes in `beginTransaction / commitTransaction`
+- All writes land atomically (or none); consumer reads with `isolation.level=read_committed`
+- Trade-off: 20–30% throughput reduction for transactional producers; use only where required
+- Alternative: merge into single topic with type field to avoid cross-topic ordering entirely
+
+### "Constraint: messages must be deduplicated (exactly-once end-to-end)"
+- Producer: enable idempotent producer (`enable.idempotence=true`) → sequence numbers prevent broker-side duplicates on retry
+- Consumer: commit offset only after successful processing; use outbox pattern for consumer-DB atomicity
+- Idempotency key in message payload — downstream services use it to deduplicate DB writes
+
+### "Constraint: reduce storage cost 5× (data growing too fast)"
+- Enable log compaction on key-based topics: broker keeps only latest value per key → O(keys) storage not O(events)
+- Tiered storage: offload segments older than 1 day to S3 (Confluent tiered storage, MSK tiered storage)
+- Reduce replication factor from 3 → 2 for non-critical topics (saves 33% storage at cost of durability)
+- Compress at producer: `compression.type=zstd` → 3–5× compression on text/JSON payloads
