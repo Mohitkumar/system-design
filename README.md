@@ -55,7 +55,10 @@ Sources: DDIA (Kleppmann) + Distributed Systems for Fun and Profit (Takada)
 
 - [cockroachdb.md](design/cockroachdb.md) — distributed SQL, Raft per range, SSI, HLC, intent-based commit, DistSQL
 - [tikv.md](design/tikv.md) — distributed KV, Multi-Raft regions, Percolator 2PC, TSO, RocksDB CFs
+- [s3.md](design/s3.md) — S3 HLD+LLD: write/read path, multipart internals, erasure coding, strong consistency, versioning, lifecycle, CRR, pre-signed URLs
 - [blobstore.md](design/blobstore.md) — S3/Azure/GCS design, chunking, multipart, erasure coding, GC, pre-signed URLs, tiering
+- [sqs.md](design/sqs.md) — Standard vs FIFO, visibility timeout, DLQ, long polling, fan-out patterns, internals
+- [dynamodb.md](design/dynamodb.md) — partitioning, GSI/LSI, transactions (2PC), streams, Global Tables, single-table design, DAX
 - [ratelimiter.md](design/ratelimiter.md) — algorithms, Redis counter, Lua atomicity, distributed limiting, fail-open
 - [key_value_store.md](design/key_value_store.md)
 - [distributed_cache.md](design/distributed_cache.md)
