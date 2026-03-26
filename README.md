@@ -30,6 +30,10 @@ Sources: DDIA (Kleppmann) + Distributed Systems for Fun and Profit (Takada)
 - [two_phase_commit.md](concepts/consensus/two_phase_commit.md) — 2PC, distributed transactions, XA, saga pattern
 - [coordination_services.md](concepts/consensus/coordination_services.md) — ZooKeeper, etcd, leader election, distributed locks
 
+### algorithms/
+- [data_structures.md](concepts/algorithms/data_structures.md) — skip list, B+tree, bloom filter, inverted index, R-tree, trie, HLL, count-min, merkle tree, roaring bitmap, consistent hash
+- [algorithms.md](concepts/algorithms/algorithms.md) — sorting, searching, hashing, compression, graph traversal, cache eviction, query optimization, MVCC, gossip, Raft, SIMD
+
 ### storage/
 - [storage_engine.md](concepts/storage/storage_engine.md) — B+tree, LSM tree, MVCC, indexing (clustered, secondary, hash, composite)
 
