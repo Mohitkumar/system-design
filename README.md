@@ -35,6 +35,12 @@ Sources: DDIA (Kleppmann) + Distributed Systems for Fun and Profit (Takada)
 
 ---
 
+## capacity/
+
+- [capacity_planning.md](capacity/capacity_planning.md) — Power of 2, latency numbers, QPS/storage/bandwidth estimation framework, sizing cheatsheet
+
+---
+
 ## design/
 
 - [key_value_store.md](design/key_value_store.md)
