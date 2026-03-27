@@ -43,10 +43,31 @@
 3. Follower requests all changes since snapshot (via log sequence number)
 4. Follower catches up → serves requests
 
-### Failover Risks
-- New leader may miss recent writes → **data loss**
-- Old leader wakes up → **split brain** (two leaders accepting writes)
-- Wrong timeout → unnecessary failovers and cascading load
+### Leader Failover Process
+
+```
+1. Detect failure     — heartbeat timeout (typically 30s); avoid false positives from GC pauses
+2. Elect new leader   — replica with most up-to-date replication offset wins
+                        (Raft: candidate requests votes; needs majority)
+                        (Sentinel: ≥ quorum Sentinels agree)
+3. Reconfigure clients— old leader connections rejected; clients redirect to new leader
+4. Old leader rejoins — must be demoted to follower; must discard any writes not replicated
+```
+
+| Method | How | Used By |
+|--------|-----|---------|
+| **Raft election** | Followers time out → become candidate → request votes → majority = leader | etcd, CockroachDB, TiKV |
+| **Sentinel** | External watchers monitor leader; quorum vote to promote replica | Redis Sentinel |
+| **Manual failover** | Operator promotes replica | PostgreSQL (default), MySQL |
+
+### Failover Risks & Mitigations
+
+| Risk | What happens | Mitigation |
+|------|-------------|------------|
+| **Data loss** | New leader lacks writes not yet replicated from old leader | Semi-sync replication — wait for ≥1 follower ACK before returning success |
+| **Split brain** | Old leader revives, both accept writes | Fencing: epoch/generation number; old leader rejects writes if it sees higher epoch; STONITH (shoot the other node) |
+| **False positive** | High load / GC pause looks like failure → unnecessary failover | Tunable timeout + hysteresis (require N consecutive misses, not just 1) |
+| **Replica too far behind** | Promoted replica diverges significantly → data loss even with election | Set max replication lag threshold; don't elect replicas lagging >N bytes/ms |
 
 ---
 
@@ -113,6 +134,31 @@ w + r > n
 ### Read Repair + Anti-Entropy
 - **Read repair**: on read, detect stale replica → write newest value back
 - **Anti-entropy**: background process constantly compares and syncs differences
+
+### Leaderless "Failover" — No Election Needed
+
+Leaderless systems have no leader to fail over from. Instead, availability is structural:
+
+```
+Normal (n=3, w=2, r=2):
+  Client writes to all 3 → 2 ACK → success
+  Node A goes down → write to B + C → still meets w=2
+
+Node A recovers:
+  Stale → read repair catches up A on next read
+  Or: anti-entropy background sync catches up A
+```
+
+| Scenario | What happens | Recovery |
+|----------|-------------|----------|
+| **1 of 3 nodes down** | Writes/reads still meet quorum (w=2, r=2) | Node rejoins → read repair + anti-entropy syncs missed writes |
+| **2 of 3 nodes down** | Quorum unmet → writes/reads fail (CP behavior) | Wait for nodes to recover; or relax to sloppy quorum |
+| **Network partition** | Two sides each below quorum → reject | Each side rejects; no split-brain writes (unlike multi-leader) |
+| **Sloppy quorum** | Accept writes on available nodes even if not the "home" N | Hinted handoff: writes stored temporarily on substitute; forwarded when target recovers |
+
+**Hinted handoff**: substitute node stores write with a hint `"this belongs to node A"`; when A recovers, substitute forwards the write. Improves availability but breaks quorum overlap guarantees — only **best-effort** durability.
+
+**Anti-entropy with Merkle trees**: each node builds a Merkle tree of its key range; nodes exchange tree hashes to find differing subtrees efficiently → sync only divergent keys (O(diff) not O(total)).
 
 ---
 
